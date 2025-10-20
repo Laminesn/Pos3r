@@ -304,57 +304,55 @@ print(" camera_to_world_look_at defined")
 def render_template_with_obj_xyz(mesh, K, cam_pose, img_size=(640, 480)):
     """
     Render template and return RGB + xyz_map in OBJECT frame (mm).
-    cam_pose: 4x4 camera-to-world (or use R_cam, t_cam for world-to-camera).
+    cam_pose: 4x4 camera-to-world matrix.
     """
     import pyrender
-    import trimesh
     
     scene = pyrender.Scene(ambient_light=[0.3, 0.3, 0.3])
+    scene.add(pyrender.Mesh.from_trimesh(mesh, smooth=False))
     
-    # Add mesh
-    mesh_node = scene.add(pyrender.Mesh.from_trimesh(mesh, smooth=False))
-    
-    # Camera (intrinsics)
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     cam = pyrender.IntrinsicsCamera(fx=fx, fy=fy, cx=cx, cy=cy, znear=50.0, zfar=2000.0)
+    scene.add(cam, pose=cam_pose)
     
-    # Add camera with cam_pose (4x4 camera-to-world)
-    cam_node = scene.add(cam, pose=cam_pose)
-    
-    # Render
     r = pyrender.OffscreenRenderer(viewport_width=img_size[0], viewport_height=img_size[1])
     color, depth = r.render(scene, flags=pyrender.RenderFlags.FLAT)
     r.delete()
     
-    # depth is in meters from pyrender; convert to mm
+    # Depth is in METERS, convert to MM
     depth_mm = depth * 1000.0
     
-    # Compute xyz in camera frame
+    # Compute XYZ in camera frame (mm)
     h, w = depth.shape
     u, v = np.meshgrid(np.arange(w), np.arange(h))
-    z_cam = depth_mm  # (H, W) in mm
-    x_cam = (u - cx) * z_cam / fx
-    y_cam = (v - cy) * z_cam / fy
-    xyz_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)  # (H, W, 3) in mm
     
-    # Transform to object frame: xyz_obj = R_cam^T @ (xyz_cam - t_cam)
-    # cam_pose is camera-to-world; invert to get world-to-camera (object-to-camera if object is at world origin)
-    cam_pose_inv = np.linalg.inv(cam_pose)  # world-to-camera (object-to-camera)
-    R_cam = cam_pose_inv[:3, :3]  # rotation from object to camera
-    t_cam = cam_pose_inv[:3, 3]   # translation in mm
+    x_cam = (u - cx) * depth_mm / fx
+    y_cam = (v - cy) * depth_mm / fy
+    z_cam = depth_mm
     
-    # For each pixel: obj = R^T @ (cam_xyz - t)
-    xyz_cam_flat = xyz_cam.reshape(-1, 3)  # (N, 3)
-    valid = (depth.reshape(-1) > 0)
-    xyz_obj_flat = np.zeros_like(xyz_cam_flat)
-    xyz_obj_flat[valid] = (R_cam.T @ (xyz_cam_flat[valid] - t_cam).T).T
-    obj_xyz_map = xyz_obj_flat.reshape(h, w, 3).astype(np.float32)
+    # Stack into (H,W,3)
+    xyz_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)
     
-    # Set invalid pixels to zero
-    obj_xyz_map[depth <= 0] = 0.0
+    # Transform to object frame
+    # cam_pose transforms object→camera, so we need its inverse
+    cam_to_world = cam_pose
+    world_to_cam = np.linalg.inv(cam_to_world)
+    R = world_to_cam[:3, :3]
+    t = world_to_cam[:3, 3]
     
-    return color, obj_xyz_map  # RGB (H,W,3) uint8, obj_xyz_map (H,W,3) float32 mm
+    # For each point: xyz_world = R^-1 @ (xyz_cam - t) = R^T @ (xyz_cam - t)
+    valid = depth > 0
+    xyz_obj = np.zeros_like(xyz_cam)
+    
+    for i in range(h):
+        for j in range(w):
+            if valid[i, j]:
+                p_cam = xyz_cam[i, j]
+                p_obj = R.T @ (p_cam - t)
+                xyz_obj[i, j] = p_obj
+    
+    return color, xyz_obj.astype(np.float32)
 
 # ----- Cell 18 (markdown) -----
 # ---
@@ -385,9 +383,7 @@ except NameError:
     TEMPLATE_SCALE = 2.5  # same scale must be used in evaluation
 
 def generate_templates_for_object(obj_id, save=True, scale=TEMPLATE_SCALE):
-    """
-    Generate 8×5 templates with given mesh scale (mm). Stores rgb + xyz_map (model frame).
-    """
+    """Generate 8×5 templates with given mesh scale (mm)."""
     mesh = load_cad_model(obj_id).copy()
     mesh.vertices -= mesh.centroid
     mesh.apply_scale(scale)
@@ -399,22 +395,60 @@ def generate_templates_for_object(obj_id, save=True, scale=TEMPLATE_SCALE):
 
     for view_id, cam_pos in enumerate(camera_positions):
         for rotation in [0, 72, 144, 216, 288]:
+            # Build camera pose
+            cam_pose_base = camera_to_world_look_at(cam_pos, target=np.array([0., 0., 0.]))
+            
+            # Apply in-plane rotation
+            angle_rad = np.deg2rad(rotation)
+            rot_2d = np.array([
+                [np.cos(angle_rad), -np.sin(angle_rad), 0],
+                [np.sin(angle_rad),  np.cos(angle_rad), 0],
+                [0, 0, 1]
+            ])
+            cam_pose_4x4 = cam_pose_base.copy()
+            cam_pose_4x4[:3, :3] = cam_pose_base[:3, :3] @ rot_2d
+            
+            # Render
             color, obj_xyz_map = render_template_with_obj_xyz(mesh, K, cam_pose_4x4, img_size=(640, 480))
-            template_dict['obj_xyz_map'] = obj_xyz_map  # object frame, mm
-            template_dict['rgb'] = color
-            if (depth > 0).sum() == 0:
+            
+            # Compute depth from camera for display (transform obj back to cam)
+            world_to_cam = np.linalg.inv(cam_pose_4x4)
+            R_w2c = world_to_cam[:3, :3]
+            t_w2c = world_to_cam[:3, 3]
+            
+            valid_mask = (np.abs(obj_xyz_map).sum(axis=2) > 1e-3)
+            if valid_mask.sum() == 0:
                 print(f"[tmpl] skip blank v={view_id} r={rotation}")
                 continue
+            
+            # For logging: transform obj → cam and extract Z
+            h, w = obj_xyz_map.shape[:2]
+            depth_cam = np.zeros((h, w), dtype=np.float32)
+            for i in range(h):
+                for j in range(w):
+                    if valid_mask[i, j]:
+                        p_obj = obj_xyz_map[i, j]
+                        p_cam = R_w2c @ p_obj + t_w2c
+                        depth_cam[i, j] = p_cam[2]  # Z coordinate
+            
+            d_valid = depth_cam[valid_mask]
+            print(f" Render [obj{obj_id}_v{view_id}_r{rotation}] depth>0={len(d_valid)}, range=({d_valid.min():.1f},{d_valid.max():.1f})")
+            
             templates.append({
-                'rgb': rgb, 'depth': depth, 'xyz_map': xyz_map,
-                'view_id': view_id, 'rotation': rotation,
-                'camera_pos': cam_pos, 'template_id': template_id
+                'rgb': color,
+                'obj_xyz_map': obj_xyz_map,
+                'depth': depth_cam,
+                'view_id': view_id,
+                'rotation': rotation,
+                'camera_pos': cam_pos,
+                'template_id': template_id
             })
+            
             if save:
                 cv2.imwrite(os.path.join(obj_dir, f"template_{template_id:03d}.png"),
-                            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                            cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
                 np.savez_compressed(os.path.join(obj_dir, f"template_{template_id:03d}_xyz.npz"),
-                                    xyz_map=xyz_map, depth=depth)
+                                    obj_xyz_map=obj_xyz_map, depth=depth_cam)
             template_id += 1
 
     print(f"[tmpl] obj={obj_id} templates={len(templates)} scale={scale}")
@@ -889,8 +923,8 @@ def estimate_pose_full_pipeline(frame_id, templates_dict, model, device):
     )
     
     if points_3d.shape[0] > 0:
-    print(f"[debug] 3D norms: min={np.linalg.norm(points_3d, axis=1).min():.1f} max={np.linalg.norm(points_3d, axis=1).max():.1f} mean={np.linalg.norm(points_3d, axis=1).mean():.1f} mm")
-    print(f"[debug] Sample 3D points (first 3): {points_3d[:min(3, len(points_3d))]}")
+        print(f"[debug] 3D norms: min={np.linalg.norm(points_3d, axis=1).min():.1f} max={np.linalg.norm(points_3d, axis=1).max():.1f} mean={np.linalg.norm(points_3d, axis=1).mean():.1f} mm")
+        print(f"[debug] Sample 3D points (first 3): {points_3d[:min(3, len(points_3d))]}")
 
     if len(points_2d) < 4:
         raise ValueError(f"Not enough 2D–3D correspondences: {len(points_2d)} (<4)")
